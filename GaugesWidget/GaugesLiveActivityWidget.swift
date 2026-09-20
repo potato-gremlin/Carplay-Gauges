@@ -2,8 +2,10 @@ import ActivityKit
 import SwiftUI
 import WidgetKit
 
-/// Renders the Live Activity: Lock Screen banner, Dynamic Island, and (automatically,
-/// with no extra code) the CarPlay dashboard card on iOS 18+ when the phone is connected.
+/// Renders the Live Activity: Lock Screen banner, Dynamic Island, and — by opting into the
+/// `.small` supplemental activity family — the compact persistent banner CarPlay (and the
+/// Apple Watch Smart Stack) actually render Live Activities in. No CarPlay entitlement
+/// needed for this; that's a separate thing from building a full CarPlay app.
 struct GaugesLiveActivityWidget: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: GaugeActivityAttributes.self) { context in
@@ -44,10 +46,26 @@ struct GaugesLiveActivityWidget: Widget {
                     .foregroundStyle(Color.accentColor)
             }
         }
+        .supplementalActivityFamilies([.small])
     }
 }
 
 private struct GaugeActivityBannerView: View {
+    @Environment(\.activityFamily) private var activityFamily
+    let state: GaugeActivityAttributes.ContentState
+
+    var body: some View {
+        switch activityFamily {
+        case .small:
+            GaugeActivityCompactView(state: state)
+        default:
+            GaugeActivityFullBannerView(state: state)
+        }
+    }
+}
+
+/// The default Lock Screen banner — plenty of room for all 4 gauges.
+private struct GaugeActivityFullBannerView: View {
     let state: GaugeActivityAttributes.ContentState
 
     var body: some View {
@@ -65,6 +83,33 @@ private struct GaugeActivityBannerView: View {
                 .frame(width: 7, height: 7)
                 .padding(8)
         }
+    }
+}
+
+/// The `.small` family — what CarPlay's persistent banner and the Watch Smart Stack
+/// actually render. Tight on space, so only the first two configured gauges, no sentences.
+private struct GaugeActivityCompactView: View {
+    let state: GaugeActivityAttributes.ContentState
+
+    var body: some View {
+        HStack(spacing: 14) {
+            ForEach(state.slots.prefix(2)) { slot in
+                VStack(spacing: 0) {
+                    Text(slot.valueText)
+                        .font(.system(size: 24, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(slot.zone.color)
+                        .minimumScaleFactor(0.6)
+                        .lineLimit(1)
+                    Text("\(slot.label) \(slot.unit)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
     }
 }
 

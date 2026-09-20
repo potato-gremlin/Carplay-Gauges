@@ -2,7 +2,7 @@ name: CarplayGauges
 options:
   bundleIdPrefix: com.potatogremlin.carplaygauges
   deploymentTarget:
-    iOS: "17.0"
+    iOS: "26.0"
   createIntermediateGroups: true
   usesTabs: false
   indentWidth: 4
@@ -20,7 +20,7 @@ settings:
     DEVELOPMENT_TEAM: ""
     PROVISIONING_PROFILE_SPECIFIER: ""
     SWIFT_VERSION: "5.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     TARGETED_DEVICE_FAMILY: "1"
     ENABLE_BITCODE: NO
     GENERATE_INFOPLIST_FILE: NO
@@ -33,7 +33,7 @@ targets:
   CarplayGauges:
     type: application
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "26.0"
     sources:
       - path: Gauges
         excludes:
@@ -73,7 +73,7 @@ targets:
   GaugesWidgetExtension:
     type: app-extension
     platform: iOS
-    deploymentTarget: "17.0"
+    deploymentTarget: "26.0"
     sources:
       - path: GaugesWidget
         excludes:

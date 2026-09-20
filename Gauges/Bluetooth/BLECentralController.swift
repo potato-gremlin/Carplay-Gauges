@@ -106,6 +106,11 @@ final class BLECentralController: NSObject {
         guard let characteristic = activeWriteChar, let peripheral = connectedPeripheral,
               peripheral.state == .connected else { return }
         guard let data = text.data(using: .ascii) else { return }
+        // A previous command's response may never have arrived (dropped/incomplete BLE
+        // packet), leaving partial bytes with no '>' terminator sitting in the buffer.
+        // Without this, that leftover text silently prepends onto the next real response
+        // forever, permanently desyncing every reading after the first hiccup.
+        rxBuffer = ""
         let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
         let maxLength = max(peripheral.maximumWriteValueLength(for: writeType), 20)
         var offset = 0
@@ -372,6 +377,11 @@ extension BLECentralController: CBPeripheralDelegate {
             if !wasProbing {
                 onDataChunk?(chunk)
             }
+        }
+        // Belt-and-suspenders: a response that never gets its '>' terminator (and so is
+        // never flushed above) shouldn't be able to grow the buffer forever.
+        if rxBuffer.utf8.count > 512 {
+            rxBuffer = ""
         }
     }
 

@@ -27,9 +27,12 @@ final class ELM327Session {
     private var pollCycleIndex = 0
     private var pendingDeviceName = "OBD Adapter"
     private var receivedAnyResponseDuringInit = false
+    private var lastActivityDate = Date()
+    private var watchdogTimer: Timer?
 
     private static let commandTimeout: TimeInterval = 3.0
     private static let maxReconnectDelay: TimeInterval = 20.0
+    private static let watchdogStallThreshold: TimeInterval = 12.0
 
     init() {
         ble.onStateChanged = { [weak self] state in
@@ -121,6 +124,7 @@ final class ELM327Session {
         guard let command = awaitingResponse else { return }
         awaitingResponse = nil
         receivedAnyResponseDuringInit = true
+        lastActivityDate = Date()
 
         if let pidID = command.pidID {
             parsePIDResponse(raw, pidID: pidID)
@@ -132,9 +136,14 @@ final class ELM327Session {
 
     private func parsePIDResponse(_ raw: String, pidID: String) {
         guard let pid = OBDPIDCatalog.byID[pidID] else { return }
+        let expectedPIDHex = String(format: "%02X", pid.pid)
         let cleaned = raw.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
         let tokens = cleaned.split(separator: " ").map(String.init).filter { !$0.isEmpty }
-        guard let modeIndex = tokens.firstIndex(of: "41") else { return }
+        // Match "41 <thisPID>" specifically, not just any "41" — guards against a stray
+        // leftover fragment from an earlier exchange being misread as this PID's answer.
+        guard let modeIndex = tokens.indices.first(where: {
+            tokens[$0] == "41" && $0 + 1 < tokens.count && tokens[$0 + 1].uppercased() == expectedPIDHex
+        }) else { return }
         let byteStart = modeIndex + 2
         guard byteStart + pid.responseByteCount <= tokens.count else { return }
         let byteTokens = tokens[byteStart..<(byteStart + pid.responseByteCount)]
@@ -150,12 +159,32 @@ final class ELM327Session {
         guard !isPolling else { return }
         isPolling = true
         pollCycleIndex = 0
+        lastActivityDate = Date()
+        startWatchdog()
         queueNextPIDIfNeeded()
     }
 
     private func stopPolling() {
         isPolling = false
         commandQueue.removeAll { $0.pidID != nil }
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
+    }
+
+    /// Extra insurance on top of the per-command timeout: if the whole session goes quiet
+    /// for way longer than any single command timeout should allow, something wedged
+    /// (subscription silently dropped, adapter locked up, etc.) — reconnect from scratch
+    /// rather than sit there showing stale numbers forever.
+    private func startWatchdog() {
+        watchdogTimer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
+            guard let self, self.isPolling else { return }
+            if Date().timeIntervalSince(self.lastActivityDate) > Self.watchdogStallThreshold {
+                self.handleFailure("No response from the adapter for a while — reconnecting.")
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdogTimer = timer
     }
 
     private func queueNextPIDIfNeeded() {
