@@ -14,6 +14,7 @@ final class VehicleDataStore {
     var lastError: String?
 
     private(set) var isLiveActivityEnabled: Bool
+    let diagnosticsLog = DiagnosticsLog()
 
     private static let liveActivityDefaultsKey = "com.potatogremlin.carplaygauges.liveActivityEnabled"
 
@@ -32,6 +33,7 @@ final class VehicleDataStore {
         session.onDiscoveredPeripheral = { [weak self] peripheral in self?.handleDiscovered(peripheral) }
         session.onBluetoothUnavailable = { [weak self] message in self?.bluetoothWarning = message }
         session.onError = { [weak self] message in self?.lastError = message }
+        session.onLog = { [weak self] direction, text in self?.diagnosticsLog.log(direction, text) }
         demo.onReading = { [weak self] pidID, value in self?.handle(pidID: pidID, value: value) }
     }
 

@@ -16,6 +16,7 @@ final class ELM327Session {
     var onDiscoveredPeripheral: ((DiscoveredPeripheral) -> Void)?
     var onBluetoothUnavailable: ((String) -> Void)?
     var onError: ((String) -> Void)?
+    var onLog: ((DiagnosticsDirection, String) -> Void)?
 
     private var activePIDs: [OBDPID] = []
     private var commandQueue: [PendingCommand] = []
@@ -30,6 +31,16 @@ final class ELM327Session {
     private var lastActivityDate = Date()
     private var watchdogTimer: Timer?
 
+    /// Cheap/generic ELM327 clones are notoriously unreliable with "ATSP0" auto-detect on
+    /// Ford's CAN bus. A 2015 Mustang's OBD port is ISO 15765-4 CAN, 11-bit ID, 500kbaud
+    /// (SAE protocol 6) — try that explicitly first, and only fall back to auto-detect if
+    /// it's clearly not yielding real data.
+    private let protocolCandidates = ["6", "0"]
+    private var protocolCandidateIndex = 0
+    private var pollAttemptsSinceInit = 0
+    private var pollSuccessesSinceInit = 0
+    private static let protocolTrialSampleSize = 8
+
     private static let commandTimeout: TimeInterval = 3.0
     private static let maxReconnectDelay: TimeInterval = 20.0
     private static let watchdogStallThreshold: TimeInterval = 12.0
@@ -38,6 +49,7 @@ final class ELM327Session {
         ble.onStateChanged = { [weak self] state in
             guard let self else { return }
             if case .connecting(let name) = state { self.pendingDeviceName = name }
+            self.onLog?(.info, "state: \(state.label)")
             self.onStateChanged?(state)
         }
         ble.onPeripheralDiscovered = { [weak self] peripheral in self?.onDiscoveredPeripheral?(peripheral) }
@@ -72,9 +84,13 @@ final class ELM327Session {
     private func beginAdapterInit() {
         reconnectAttempt = 0
         receivedAnyResponseDuringInit = false
+        pollAttemptsSinceInit = 0
+        pollSuccessesSinceInit = 0
         commandQueue.removeAll()
         awaitingResponse = nil
-        for cmd in ["ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATSP0"] {
+        let protocolCommand = "ATSP" + protocolCandidates[protocolCandidateIndex]
+        onLog?(.info, "initializing adapter, protocol candidate \(protocolCandidates[protocolCandidateIndex])")
+        for cmd in ["ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", protocolCommand] {
             commandQueue.append(PendingCommand(text: cmd, pidID: nil))
         }
         processQueueIfIdle()
@@ -104,6 +120,7 @@ final class ELM327Session {
         }
         let command = commandQueue.removeFirst()
         awaitingResponse = command
+        onLog?(.sent, command.text)
         ble.send(command.text + "\r")
 
         let workItem = DispatchWorkItem { [weak self] in self?.handleTimeout() }
@@ -114,7 +131,9 @@ final class ELM327Session {
     private func handleTimeout() {
         guard let command = awaitingResponse else { return }
         awaitingResponse = nil
+        onLog?(.error, "\(command.text) timed out")
         let wasLastSetupCommand = command.pidID == nil && commandQueue.isEmpty
+        if command.pidID != nil { trackPollOutcome(success: false) }
         processQueueIfIdle()
         if wasLastSetupCommand { finishInitIfNeeded() }
     }
@@ -125,17 +144,20 @@ final class ELM327Session {
         awaitingResponse = nil
         receivedAnyResponseDuringInit = true
         lastActivityDate = Date()
+        onLog?(.received, raw.trimmingCharacters(in: .whitespacesAndNewlines))
 
         if let pidID = command.pidID {
-            parsePIDResponse(raw, pidID: pidID)
+            let success = parsePIDResponse(raw, pidID: pidID)
+            trackPollOutcome(success: success)
         }
         let wasLastSetupCommand = command.pidID == nil && commandQueue.isEmpty
         processQueueIfIdle()
         if wasLastSetupCommand { finishInitIfNeeded() }
     }
 
-    private func parsePIDResponse(_ raw: String, pidID: String) {
-        guard let pid = OBDPIDCatalog.byID[pidID] else { return }
+    @discardableResult
+    private func parsePIDResponse(_ raw: String, pidID: String) -> Bool {
+        guard let pid = OBDPIDCatalog.byID[pidID] else { return false }
         let expectedPIDHex = String(format: "%02X", pid.pid)
         let cleaned = raw.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
         let tokens = cleaned.split(separator: " ").map(String.init).filter { !$0.isEmpty }
@@ -143,14 +165,39 @@ final class ELM327Session {
         // leftover fragment from an earlier exchange being misread as this PID's answer.
         guard let modeIndex = tokens.indices.first(where: {
             tokens[$0] == "41" && $0 + 1 < tokens.count && tokens[$0 + 1].uppercased() == expectedPIDHex
-        }) else { return }
+        }) else { return false }
         let byteStart = modeIndex + 2
-        guard byteStart + pid.responseByteCount <= tokens.count else { return }
+        guard byteStart + pid.responseByteCount <= tokens.count else { return false }
         let byteTokens = tokens[byteStart..<(byteStart + pid.responseByteCount)]
         let bytes = byteTokens.compactMap { UInt8($0, radix: 16) }
         guard bytes.count == pid.responseByteCount,
-              let value = OBDDecoder.decode(pidID: pidID, bytes: bytes) else { return }
+              let value = OBDDecoder.decode(pidID: pidID, bytes: bytes) else { return false }
         onReading?(pidID, value)
+        return true
+    }
+
+    /// Watches the first handful of PID polls after each init: if none of them produced real
+    /// data (adapter is talking, e.g. "NO DATA"/"UNABLE TO CONNECT", or even just timing out
+    /// on every single PID), the protocol we picked is probably wrong for this vehicle — try
+    /// the next candidate rather than sit there polling a bus that isn't answering.
+    private func trackPollOutcome(success: Bool) {
+        pollAttemptsSinceInit += 1
+        if success { pollSuccessesSinceInit += 1 }
+        guard pollAttemptsSinceInit >= Self.protocolTrialSampleSize else { return }
+        defer {
+            pollAttemptsSinceInit = 0
+            pollSuccessesSinceInit = 0
+        }
+        guard pollSuccessesSinceInit == 0 else { return }
+        guard protocolCandidateIndex < protocolCandidates.count - 1 else {
+            onLog?(.error, "no valid data on any protocol candidate")
+            return
+        }
+        protocolCandidateIndex += 1
+        onLog?(.info, "protocol \(protocolCandidates[protocolCandidateIndex - 1]) got no data, trying \(protocolCandidates[protocolCandidateIndex])")
+        // Defer to the next run loop turn so we don't reinitialize from inside the very
+        // handleResponse/handleTimeout call that's still unwinding.
+        DispatchQueue.main.async { [weak self] in self?.beginAdapterInit() }
     }
 
     // MARK: - Polling
@@ -215,6 +262,7 @@ final class ELM327Session {
 
     private func handleFailure(_ message: String) {
         onError?(message)
+        onLog?(.error, message)
         stopPolling()
         ble.disconnect()
         scheduleReconnect()

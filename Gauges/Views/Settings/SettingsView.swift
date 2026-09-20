@@ -60,6 +60,14 @@ struct SettingsView: View {
                     }
                 }
 
+                Section {
+                    NavigationLink("Diagnostics") {
+                        DiagnosticsView(log: store.diagnosticsLog)
+                    }
+                } footer: {
+                    Text("A raw trace of every command sent to the adapter and every response received \u{2014} useful for troubleshooting a connection that won't show live data.")
+                }
+
                 Section("About") {
                     LabeledContent("Vehicle", value: "2015 Ford Mustang")
                     LabeledContent("Adapter", value: "Generic ELM327 BLE (e.g. DA100)")
