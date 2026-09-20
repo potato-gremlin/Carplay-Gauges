@@ -31,16 +31,6 @@ final class ELM327Session {
     private var lastActivityDate = Date()
     private var watchdogTimer: Timer?
 
-    /// Cheap/generic ELM327 clones are notoriously unreliable with "ATSP0" auto-detect on
-    /// Ford's CAN bus. A 2015 Mustang's OBD port is ISO 15765-4 CAN, 11-bit ID, 500kbaud
-    /// (SAE protocol 6) — try that explicitly first, and only fall back to auto-detect if
-    /// it's clearly not yielding real data.
-    private let protocolCandidates = ["6", "0"]
-    private var protocolCandidateIndex = 0
-    private var pollAttemptsSinceInit = 0
-    private var pollSuccessesSinceInit = 0
-    private static let protocolTrialSampleSize = 8
-
     private static let commandTimeout: TimeInterval = 3.0
     private static let maxReconnectDelay: TimeInterval = 20.0
     private static let watchdogStallThreshold: TimeInterval = 12.0
@@ -84,13 +74,13 @@ final class ELM327Session {
     private func beginAdapterInit() {
         reconnectAttempt = 0
         receivedAnyResponseDuringInit = false
-        pollAttemptsSinceInit = 0
-        pollSuccessesSinceInit = 0
         commandQueue.removeAll()
         awaitingResponse = nil
-        let protocolCommand = "ATSP" + protocolCandidates[protocolCandidateIndex]
-        onLog?(.info, "initializing adapter, protocol candidate \(protocolCandidates[protocolCandidateIndex])")
-        for cmd in ["ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", protocolCommand] {
+        onLog?(.info, "initializing adapter")
+        // Protocol 6 = ISO 15765-4 CAN, 11-bit ID, 500kbaud: the standard OBD port protocol
+        // for 2008+ Fords (confirmed against a real 2015 Mustang — real RPM/throttle data
+        // came back on this protocol). ATAT1 = adaptive timing, for marginal adapters.
+        for cmd in ["ATZ", "ATE0", "ATL0", "ATS0", "ATH0", "ATAT1", "ATSP6"] {
             commandQueue.append(PendingCommand(text: cmd, pidID: nil))
         }
         processQueueIfIdle()
@@ -133,7 +123,6 @@ final class ELM327Session {
         awaitingResponse = nil
         onLog?(.error, "\(command.text) timed out")
         let wasLastSetupCommand = command.pidID == nil && commandQueue.isEmpty
-        if command.pidID != nil { trackPollOutcome(success: false) }
         processQueueIfIdle()
         if wasLastSetupCommand { finishInitIfNeeded() }
     }
@@ -146,18 +135,20 @@ final class ELM327Session {
         lastActivityDate = Date()
         onLog?(.received, raw.trimmingCharacters(in: .whitespacesAndNewlines))
 
+        // "NO DATA" is a normal, valid answer — it means the adapter and protocol are working
+        // fine and the vehicle's ECU simply didn't respond to that specific PID right now
+        // (e.g. the engine isn't running, or this PID isn't supported on this vehicle). It is
+        // NOT a sign that something is broken, so nothing here treats it as a failure.
         if let pidID = command.pidID {
-            let success = parsePIDResponse(raw, pidID: pidID)
-            trackPollOutcome(success: success)
+            parsePIDResponse(raw, pidID: pidID)
         }
         let wasLastSetupCommand = command.pidID == nil && commandQueue.isEmpty
         processQueueIfIdle()
         if wasLastSetupCommand { finishInitIfNeeded() }
     }
 
-    @discardableResult
-    private func parsePIDResponse(_ raw: String, pidID: String) -> Bool {
-        guard let pid = OBDPIDCatalog.byID[pidID] else { return false }
+    private func parsePIDResponse(_ raw: String, pidID: String) {
+        guard let pid = OBDPIDCatalog.byID[pidID] else { return }
         let expectedPIDHex = String(format: "%02X", pid.pid)
         let cleaned = raw.replacingOccurrences(of: "\r", with: " ").replacingOccurrences(of: "\n", with: " ")
         let tokens = cleaned.split(separator: " ").map(String.init).filter { !$0.isEmpty }
@@ -165,39 +156,14 @@ final class ELM327Session {
         // leftover fragment from an earlier exchange being misread as this PID's answer.
         guard let modeIndex = tokens.indices.first(where: {
             tokens[$0] == "41" && $0 + 1 < tokens.count && tokens[$0 + 1].uppercased() == expectedPIDHex
-        }) else { return false }
+        }) else { return }
         let byteStart = modeIndex + 2
-        guard byteStart + pid.responseByteCount <= tokens.count else { return false }
+        guard byteStart + pid.responseByteCount <= tokens.count else { return }
         let byteTokens = tokens[byteStart..<(byteStart + pid.responseByteCount)]
         let bytes = byteTokens.compactMap { UInt8($0, radix: 16) }
         guard bytes.count == pid.responseByteCount,
-              let value = OBDDecoder.decode(pidID: pidID, bytes: bytes) else { return false }
+              let value = OBDDecoder.decode(pidID: pidID, bytes: bytes) else { return }
         onReading?(pidID, value)
-        return true
-    }
-
-    /// Watches the first handful of PID polls after each init: if none of them produced real
-    /// data (adapter is talking, e.g. "NO DATA"/"UNABLE TO CONNECT", or even just timing out
-    /// on every single PID), the protocol we picked is probably wrong for this vehicle — try
-    /// the next candidate rather than sit there polling a bus that isn't answering.
-    private func trackPollOutcome(success: Bool) {
-        pollAttemptsSinceInit += 1
-        if success { pollSuccessesSinceInit += 1 }
-        guard pollAttemptsSinceInit >= Self.protocolTrialSampleSize else { return }
-        defer {
-            pollAttemptsSinceInit = 0
-            pollSuccessesSinceInit = 0
-        }
-        guard pollSuccessesSinceInit == 0 else { return }
-        guard protocolCandidateIndex < protocolCandidates.count - 1 else {
-            onLog?(.error, "no valid data on any protocol candidate")
-            return
-        }
-        protocolCandidateIndex += 1
-        onLog?(.info, "protocol \(protocolCandidates[protocolCandidateIndex - 1]) got no data, trying \(protocolCandidates[protocolCandidateIndex])")
-        // Defer to the next run loop turn so we don't reinitialize from inside the very
-        // handleResponse/handleTimeout call that's still unwinding.
-        DispatchQueue.main.async { [weak self] in self?.beginAdapterInit() }
     }
 
     // MARK: - Polling
