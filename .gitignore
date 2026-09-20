@@ -1,0 +1,13 @@
+## Xcode / XcodeGen
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+build/
+
+## Build artifacts
+Payload/
+*.ipa
+
+## macOS
+.DS_Store
